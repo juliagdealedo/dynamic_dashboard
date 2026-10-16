@@ -1,0 +1,631 @@
+---
+title: "Dynamic dashboard — community and species trends"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: scroll
+runtime: shiny
+---
+
+```{r global, include=FALSE}
+library(flexdashboard)
+library(shiny)
+library(dplyr)
+library(ggplot2)
+library(glmmTMB)
+library(grid)
+library(gridExtra)
+library(leaflet)
+
+# Keep the default CSV in the same folder as this Rmd file.
+default_file <- "synthetic_pollinator_counts_2014_2026_3sites.csv"
+required_columns <- c("year", "species", "group", "count")
+
+# Mandatory: year, species, group, count.
+# Optional: site, latitude, longitude (all independent optional fields).
+read_counts <- function(path) {
+  x <- tryCatch(
+    read.csv(path, stringsAsFactors = FALSE, check.names = FALSE,
+             na.strings = c("", "NA", "NaN")),
+    error = function(e) stop("Cannot read CSV: ", conditionMessage(e))
+  )
+  names(x) <- tolower(trimws(names(x)))
+  if (anyDuplicated(names(x))) stop("Duplicate column names after standardization.")
+  missing <- setdiff(required_columns, names(x))
+  if (length(missing)) {
+    stop("CSV must contain year, species, group, count. Missing: ",
+         paste(missing, collapse = ", "))
+  }
+  if (!"site" %in% names(x)) x$site <- "Unspecified"
+  if (!"latitude" %in% names(x)) x$latitude <- NA_real_
+  if (!"longitude" %in% names(x)) x$longitude <- NA_real_
+
+  x <- x[, c(required_columns, "site", "latitude", "longitude")]
+  x$year <- suppressWarnings(as.numeric(as.character(x$year)))
+  x$count <- suppressWarnings(as.numeric(as.character(x$count)))
+  x$latitude <- suppressWarnings(as.numeric(as.character(x$latitude)))
+  x$longitude <- suppressWarnings(as.numeric(as.character(x$longitude)))
+  x$species <- trimws(as.character(x$species))
+  x$group <- trimws(as.character(x$group))
+  x$site <- trimws(as.character(x$site))
+  x$site[is.na(x$site) | !nzchar(x$site)] <- "Unspecified"
+
+  if (nrow(x) == 0) stop("The CSV has no rows.")
+  if (anyNA(x$year) || any(x$year != floor(x$year)))
+    stop("'year' must contain integer years without missing values.")
+  if (anyNA(x$count) || any(!is.finite(x$count)) || any(x$count < 0))
+    stop("'count' must contain finite, non-negative numbers.")
+  if (anyNA(x$species) || anyNA(x$group) ||
+      any(!nzchar(x$species)) || any(!nzchar(x$group)))
+    stop("'species' and 'group' cannot be missing or blank.")
+  if (any(!is.na(x$latitude) & (!is.finite(x$latitude) |
+                                abs(x$latitude) > 90)) ||
+      any(!is.na(x$longitude) & (!is.finite(x$longitude) |
+                                 abs(x$longitude) > 180)))
+    stop("Invalid latitude or longitude.")
+
+  # Incomplete coordinate pairs are allowed; only complete pairs are mapped.
+  x$year <- as.integer(x$year)
+  x %>%
+    group_by(year, group, species, site) %>%
+    summarise(
+      count = sum(count),
+      latitude = {
+        v <- unique(latitude[!is.na(latitude)])
+        if (length(v)) v[1] else NA_real_
+      },
+      longitude = {
+        v <- unique(longitude[!is.na(longitude)])
+        if (length(v)) v[1] else NA_real_
+      },
+      .groups = "drop"
+    ) %>%
+    arrange(year, group, species, site)
+}
+
+# Fit each annual response with an appropriate observation model:
+# - richness: always Poisson with log link;
+# - abundance: Poisson with log link if original counts are all integers;
+#              Gaussian on log(1 + abundance) if original counts are fractional.
+# A single series can make AR(1) estimation unstable. Fall back explicitly
+# to a model without AR(1) when the AR(1) fit fails diagnostics.
+fit_trend <- function(df, response = c("abundance", "richness"),
+                      abundance_is_integer = TRUE) {
+  response <- match.arg(response)
+  df <- as.data.frame(df[order(df$year), , drop = FALSE])
+  y <- if (response == "richness") df$richness else df$abundance
+
+  is_poisson <- response == "richness" || isTRUE(abundance_is_integer)
+  family_label <- if (is_poisson) "Poisson log-link" else
+    "Gaussian model of log(1 + abundance)"
+
+  out <- list(
+    predicted = rep(NA_real_, nrow(df)),
+    model = "Not fitted", family = family_label,
+    slope = NA_real_, annual_change = NA_real_,
+    p_value = NA_real_, phi = NA_real_, aic = NA_real_,
+    residual_sd = NA_real_, convergence = NA,
+    note = ""
+  )
+
+  if (nrow(df) < 3 || length(unique(df$year)) < 3) {
+    out$note <- "At least three observed years are required."
+    return(out)
+  }
+  if (is_poisson && any(abs(y - round(y)) > 1e-8)) {
+    out$note <- "Poisson models require non-negative integer observations."
+    return(out)
+  }
+  if (all(y == y[1])) {
+    out$note <- "No variation in the response; trend not fitted."
+    return(out)
+  }
+
+  df$year_index <- df$year - min(df$year)
+  # Full factor levels preserve the actual year gaps in AR(1).
+  df$year_factor <- factor(df$year, levels = seq(min(df$year), max(df$year)))
+  df$series_id <- factor("one_series")
+
+  df$y_model <- if (is_poisson) y else log1p(y)
+  fam <- if (is_poisson) poisson(link = "log") else gaussian()
+
+  ar_fit <- tryCatch(
+    suppressWarnings(glmmTMB(
+      y_model ~ year_index + ar1(year_factor + 0 | series_id),
+      data = df, family = fam
+    )),
+    error = function(e) NULL
+  )
+
+  ar1_ok <- !is.null(ar_fit) &&
+    isTRUE(ar_fit$fit$convergence == 0) &&
+    isTRUE(ar_fit$sdr$pdHess)
+
+  if (ar1_ok) {
+    beta <- tryCatch(unname(fixef(ar_fit)$cond["year_index"]),
+                     error = function(e) NA_real_)
+    p <- tryCatch(
+      summary(ar_fit)$coefficients$cond["year_index", "Pr(>|z|)"],
+      error = function(e) NA_real_
+    )
+    phi <- tryCatch({
+      cc <- attr(VarCorr(ar_fit)$cond$series_id, "correlation")
+      as.numeric(cc[1, 2])
+    }, error = function(e) NA_real_)
+
+    predicted <- tryCatch(
+      as.numeric(predict(ar_fit, newdata = df,
+                         type = "response", re.form = NA)),
+      error = function(e) rep(NA_real_, nrow(df))
+    )
+
+    # If extracting essential quantities fails, use the fallback instead.
+    ar1_ok <- is.finite(beta) && is.finite(p) &&
+      all(is.finite(predicted)) && is.finite(phi)
+  }
+
+  if (ar1_ok) {
+    out$model <- paste0("GLMM with AR(1); ", family_label)
+    out$convergence <- TRUE
+    out$phi <- phi
+    out$aic <- as.numeric(AIC(ar_fit))
+    out$residual_sd <- if (!is_poisson) as.numeric(sigma(ar_fit)) else NA_real_
+  } else {
+    fallback <- tryCatch(
+      if (is_poisson) {
+        glm(y_model ~ year_index, data = df, family = poisson(link = "log"))
+      } else {
+        lm(y_model ~ year_index, data = df)
+      },
+      error = function(e) NULL
+    )
+
+    if (is.null(fallback)) {
+      out$note <- "Both the AR(1) model and fallback failed."
+      return(out)
+    }
+
+    beta <- unname(coef(fallback)["year_index"])
+    p <- tryCatch(
+      summary(fallback)$coefficients["year_index", 4],
+      error = function(e) NA_real_
+    )
+    predicted <- tryCatch(
+      as.numeric(predict(fallback, newdata = df, type = "response")),
+      error = function(e) rep(NA_real_, nrow(df))
+    )
+
+    out$model <- paste0("Fallback without AR(1); ", family_label)
+    out$convergence <- FALSE
+    out$aic <- as.numeric(AIC(fallback))
+    out$residual_sd <- if (!is_poisson) as.numeric(sigma(fallback)) else NA_real_
+    out$note <- "AR(1) fit was unreliable; model without AR(1) used."
+  }
+
+  # Poisson predictions are already on the original count scale.
+  # Gaussian predictions must be back-transformed from log(1 + abundance).
+  if (!is_poisson) predicted <- expm1(predicted)
+
+  out$predicted <- pmax(0, predicted)
+  out$slope <- beta
+  out$annual_change <- 100 * expm1(beta)
+  out$p_value <- p
+  # For Gaussian fits, annual_change refers to (1 + abundance), not abundance.
+  out
+}
+
+format_value <- function(x, digits = 3) {
+  if (length(x) == 0 || is.na(x) || !is.finite(x)) return("NA")
+  format(round(x, digits), nsmall = digits, trim = TRUE)
+}
+
+model_table <- function(result, df, response) {
+  data.frame(
+    Metric = c("Response", "Observed years", "Period", "Mean observed value", "Variance of observed values",
+               "Model", "Annual change (%; model scale)", "Slope (model scale)",
+               "Slope p-value", "AR(1) phi", "Residual SD (model scale)", "AIC", "AR(1) converged", "Note"),
+    Value = c(response, nrow(df),
+              paste(min(df$year), "–", max(df$year)),
+              format_value(mean(if (response == "Richness") df$richness else df$abundance), 2),
+              format_value(var(if (response == "Richness") df$richness else df$abundance), 2),
+              result$model, format_value(result$annual_change, 2),
+              format_value(result$slope, 4),
+              format_value(result$p_value, 4),
+              format_value(result$phi, 3),
+              format_value(result$residual_sd, 3),
+              format_value(result$aic, 1),
+              if (is.na(result$convergence)) "Not fitted" else
+                if (result$convergence) "Yes" else "No (fallback)",
+              result$note),
+    stringsAsFactors = FALSE
+  )
+}
+
+plot_series <- function(df, result, response, heading, ylab) {
+  df$predicted <- result$predicted
+  subtitle <- if (is.na(result$p_value)) {
+    result$note
+  } else {
+    paste0("Annual change (model scale): ", format_value(result$annual_change, 2),
+           "% | p = ", format_value(result$p_value, 3),
+           if (!is.na(result$phi)) paste0(" | AR(1) φ = ", format_value(result$phi, 2)) else "")
+  }
+  ggplot(df, aes(x = year, y = .data[[response]])) +
+    geom_line(color = "#63748a", linewidth = 0.2) +
+    geom_point(color = "#245c85", size = 9, alpha=0.4) +
+    geom_line(aes(y = predicted), color = "#d47734", linewidth = 2.4,
+              na.rm = TRUE) +
+    scale_x_continuous(breaks = pretty(df$year, n = 8)) +
+    labs(title = heading, subtitle = subtitle, x = "Year", y = ylab,
+         caption = "Blue: observations | Orange: modelled trend") +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"),
+          plot.subtitle = element_text(size = 9),
+          plot.caption = element_text(hjust = 0))
+}
+```
+
+Column {.sidebar data-width=300}
+-----------------------------------------------------------------------
+
+### Data and filters
+
+```{r}
+fileInput("uploaded_csv", "Upload your own CSV (optional)",
+          accept = c(".csv", "text/csv"))
+helpText("Default: synthetic_pollinator_counts_2014_2026_3sites.csv")
+helpText("Required: year, species, group, count.")
+helpText("Optional: site, latitude, longitude.")
+
+counts_data <- reactive({
+  path <- if (is.null(input$uploaded_csv)) default_file else input$uploaded_csv$datapath
+  dat <- tryCatch(read_counts(path), error = function(e) e)
+  validate(need(!inherits(dat, "error"),
+                if (inherits(dat, "error")) conditionMessage(dat) else ""))
+  dat
+})
+
+output$data_summary <- renderText({
+  dat <- counts_data()
+  source <- if (is.null(input$uploaded_csv)) "Default dataset" else input$uploaded_csv$name
+  paste0(source, " | ", n_distinct(dat$site), " sites | ", n_distinct(dat$group), " groups | ",
+         n_distinct(dat$species), " species | ",
+         n_distinct(dat$year), " observed years")
+})
+verbatimTextOutput("data_summary")
+
+output$site_selector <- renderUI({
+  dat <- counts_data()
+  choices <- c("All", sort(setdiff(unique(dat$site), "Unspecified")))
+  current <- isolate(input$selected_site)
+  selectInput("selected_site", "Select site", choices = choices,
+              selected = if (!is.null(current) && current %in% choices)
+                current else "All")
+})
+uiOutput("site_selector")
+
+output$group_selector <- renderUI({
+  dat <- counts_data()
+  req(input$selected_site)
+  if (input$selected_site != "All")
+    dat <- dat %>% filter(site == input$selected_site)
+  choices <- c("All", sort(unique(dat$group)))
+  current <- isolate(input$selected_group)
+  selectInput("selected_group", "Select group", choices = choices,
+              selected = if (!is.null(current) && current %in% choices)
+                current else "All")
+})
+uiOutput("group_selector")
+
+output$species_selector <- renderUI({
+  dat <- counts_data()
+  req(input$selected_site, input$selected_group)
+  if (input$selected_site != "All")
+    dat <- dat %>% filter(site == input$selected_site)
+  if (input$selected_group != "All")
+    dat <- dat %>% filter(group == input$selected_group)
+  choices <- sort(unique(dat$species))
+  current <- isolate(input$selected_species)
+  selectInput("selected_species", "Select species", choices = choices,
+              selected = if (!is.null(current) && current %in% choices)
+                current else choices[1])
+})
+uiOutput("species_selector")
+
+# A three-page PDF snapshot of the current filters, plots and model tables.
+# Uses the base R PDF device; no LaTeX installation is required.
+output$download_report <- downloadHandler(
+  filename = function() {
+    grp <- if (is.null(input$selected_group)) "all" else input$selected_group
+    site <- if (is.null(input$selected_site)) "all" else input$selected_site
+    paste0("trend_report_", gsub("[^A-Za-z0-9_-]", "_", site), "_",
+           gsub("[^A-Za-z0-9_-]", "_", grp),
+           "_", format(Sys.Date(), "%Y%m%d"), ".pdf")
+  },
+  content = function(file) {
+    # Snapshot all current reactive values before opening the PDF device.
+    site_name <- isolate(input$selected_site)
+    group_name <- isolate(input$selected_group)
+    species_name <- isolate(input$selected_species)
+    community <- community_years()
+    individual <- species_years()
+    community_abundance <- community_abundance_model()
+    community_richness <- community_richness_model()
+    species_abundance <- species_abundance_model()
+
+    report_page <- function(df, result, response, heading, ylab, label) {
+      figure <- plot_series(df, result, response, heading, ylab)
+      details <- model_table(result, df,
+                             if (response == "richness") "Richness" else "Abundance")
+      details$Metric <- as.character(details$Metric)
+      details$Value <- as.character(details$Value)
+      details$Metric[details$Metric == "Annual change (%; model scale)"] <-
+        "Annual change (%)"
+      tab <- gridExtra::tableGrob(
+        details, rows = NULL,
+        theme = gridExtra::ttheme_minimal(
+          base_size = 8,
+          core = list(fg_params = list(hjust = 0, x = 0.05)),
+          colhead = list(fg_params = list(fontface = "bold"))
+        )
+      )
+      header <- grid::textGrob(
+        "Temporal trends | selected-data report",
+        x = 0.02, hjust = 0,
+        gp = grid::gpar(fontsize = 15, fontface = "bold")
+      )
+      metadata <- grid::textGrob(
+        paste0("Site: ", site_name, "    Group: ", group_name,
+               "    Species: ", species_name,
+               "    Generated: ", format(Sys.Date(), "%Y-%m-%d"),
+               "    Panel: ", label),
+        x = 0.02, hjust = 0,
+        gp = grid::gpar(fontsize = 9)
+      )
+      gridExtra::grid.arrange(
+        header, metadata, figure, tab,
+        layout_matrix = matrix(c(1, 1, 2, 2, 3, 4),
+                               nrow = 3, byrow = TRUE),
+        widths = c(0.62, 0.38),
+        heights = c(0.06, 0.05, 0.89)
+      )
+    }
+
+    grDevices::pdf(file, width = 12, height = 8.5,
+                   paper = "special", onefile = TRUE)
+    on.exit(grDevices::dev.off(), add = TRUE)
+
+    group_label <- if (group_name == "All") "All groups" else group_name
+    report_page(community, community_abundance, "abundance",
+                paste(group_label, "— total abundance"),
+                "Summed abundance", "Community abundance")
+    report_page(community, community_richness, "richness",
+                paste(group_label, "— species richness"),
+                "Number of species with positive count", "Community richness")
+    report_page(individual, species_abundance, "abundance",
+                paste("Species:", species_name),
+                "Species abundance", "Selected species")
+
+    loc <- site_locations()
+    if (nrow(loc) > 0) {
+      map_plot <- ggplot(loc, aes(x = longitude, y = latitude)) +
+        geom_point(color = "#2673a4", size = 4) +
+        geom_text(aes(label = site), nudge_y = 0.007, size = 4) +
+        coord_fixed() +
+        labs(title = "Selected monitoring sites",
+             subtitle = "Coordinates supplied with the data (no basemap)",
+             x = "Longitude", y = "Latitude") +
+        theme_minimal(base_size = 14)
+      print(map_plot)
+    }
+  },
+  contentType = "application/pdf"
+)
+downloadButton("download_report", "Download current selection (PDF)")
+
+selected_data <- reactive({
+  dat <- counts_data()
+  req(input$selected_site, input$selected_group)
+  if (input$selected_site != "All") dat <- filter(dat, site == input$selected_site)
+  if (input$selected_group != "All") dat <- filter(dat, group == input$selected_group)
+  dat
+})
+
+community_years <- reactive({
+  selected_data() %>%
+    group_by(year) %>%
+    summarise(abundance = sum(count),
+              richness = n_distinct(species[count > 0]),
+              .groups = "drop") %>%
+    arrange(year)
+})
+
+species_years <- reactive({
+  req(input$selected_species)
+  dat <- selected_data() %>% filter(species == input$selected_species)
+  validate(need(nrow(dat) > 0, "Choose a species from the selected group."))
+  dat %>%
+    group_by(year) %>%
+    summarise(abundance = sum(count), .groups = "drop") %>%
+    arrange(year)
+})
+
+# Determine whether ORIGINAL selected observations are integer counts.
+# Check before aggregation: summing fractional values could accidentally
+# produce integers even when the source measurements are continuous.
+is_integer_count <- function(x) all(abs(x - round(x)) < 1e-8)
+
+community_abundance_model <- reactive(
+  fit_trend(community_years(), "abundance",
+            abundance_is_integer = is_integer_count(selected_data()$count))
+)
+community_richness_model <- reactive(
+  fit_trend(community_years(), "richness")
+)
+species_abundance_model <- reactive({
+  raw_species <- selected_data() %>%
+    filter(species == input$selected_species)
+  fit_trend(species_years(), "abundance",
+            abundance_is_integer = is_integer_count(raw_species$count))
+})
+
+# Use one point per site, based on complete latitude/longitude pairs.
+# No map is shown if the uploaded data do not provide coordinates.
+site_locations <- reactive({
+  selected_data() %>%
+    filter(!is.na(latitude), !is.na(longitude)) %>%
+    group_by(site) %>%
+    summarise(latitude = first(latitude),
+              longitude = first(longitude), .groups = "drop")
+})
+
+output$site_map_ui <- renderUI({
+  loc <- site_locations()
+  if (nrow(loc) == 0) {
+    return(helpText("No site coordinates available. Add optional latitude and longitude columns to display a map."))
+  }
+  leafletOutput("site_map", height = 310)
+})
+
+output$site_map <- renderLeaflet({
+  loc <- site_locations()
+  req(nrow(loc) > 0)
+  m <- leaflet(loc) %>%
+    addProviderTiles("Esri.WorldTopoMap") %>%
+    addCircleMarkers(
+      lng = ~longitude, lat = ~latitude,
+      label = ~site, popup = ~paste0(
+        "<strong>", htmltools::htmlEscape(site), "</strong>",
+        "<br>Latitude: ", round(latitude, 5),
+        "<br>Longitude: ", round(longitude, 5)
+      ),
+      radius = 7, color = "#d47734", fillOpacity = 0.8
+    )
+  if (nrow(loc) == 1) {
+    m <- m %>% setView(lng = loc$longitude[1],
+                       lat = loc$latitude[1], zoom = 12)
+  } else {
+    m <- m %>% fitBounds(
+      lng1 = min(loc$longitude) - 0.015,
+      lat1 = min(loc$latitude) - 0.015,
+      lng2 = max(loc$longitude) + 0.015,
+      lat2 = max(loc$latitude) + 0.015
+    )
+  }
+  m
+})
+```
+
+Row {data-height=460}
+-----------------------------------------------------------------------
+
+### Community abundance trend
+
+```{r}
+renderPlot({
+  heading <- if (input$selected_group == "All") "All groups — TOTAL ABUNDANCE" else
+    paste(input$selected_group, "— TOTAL ABUNDANCE")
+  plot_series(community_years(), community_abundance_model(),
+              "abundance", heading, "Summed abundance")
+})
+```
+
+
+### Community abundance model details
+
+```{r}
+renderTable({
+  model_table(community_abundance_model(), community_years(), "Abundance")
+}, striped = TRUE, spacing = "xs")
+```
+
+
+
+Row {data-height=460}
+-----------------------------------------------------------------------
+
+
+### Community species-richness trend
+
+```{r}
+renderPlot({
+  heading <- if (input$selected_group == "All") "All groups — SPECIES RICHNESS" else
+    paste(input$selected_group, "— SPECIES RICHNESS")
+  plot_series(community_years(), community_richness_model(),
+              "richness", heading, "Number of species with positive count")
+})
+```
+
+### Community richness model details
+
+```{r}
+renderTable({
+  model_table(community_richness_model(), community_years(), "Richness")
+}, striped = TRUE, spacing = "xs")
+```
+
+Row {data-height=460}
+-----------------------------------------------------------------------
+
+### Selected species — abundance trend
+
+```{r}
+renderPlot({
+  req(input$selected_species)
+  plot_series(species_years(), species_abundance_model(), "abundance",
+              paste("Species:", input$selected_species), "Species abundance")
+})
+```
+
+### Selected species — model details
+
+```{r}
+renderTable({
+  model_table(species_abundance_model(), species_years(), "Abundance")
+}, striped = TRUE, spacing = "xs")
+```
+
+Row {data-height=210}
+-----------------------------------------------------------------------
+
+### Interpretation and data assumptions
+
+The **community abundance** is the sum of recorded species counts for the selected
+site/group (or all sites/groups) in each observed year. **Species richness** is the
+number of distinct species with a positive count in that year. With **All sites**
+selected, abundance is pooled across sites, while richness counts each species
+**only once per year** if detected at any site. These are pooled descriptive
+time series, not a site-replicated hierarchical model. The species selector
+only shows species from the selected site and group.
+
+**Model family is selected automatically for each abundance series.**
+If the underlying selected `count` observations are all non-negative integers
+(e.g., 9, 2, 1), abundance uses a **Poisson model with log link**.
+If any underlying count is fractional (e.g., 9.2, 3.1, 1.1),
+abundance uses a **Gaussian model of log(1 + abundance)**.
+Species richness always uses a **Poisson log-link model**.
+The displayed annual percentage change is `100 * (exp(slope) - 1)`.
+For Gaussian models this describes **1 + abundance**, not abundance itself.
+Each model attempts an AR(1) correlation structure; if it fails diagnostics,
+the dashboard explicitly reports a fallback model without AR(1).
+The **Download current selection (PDF)** button exports three model-report pages
+for the selected site, group, and species, plus a static site-location page if
+coordinates are available.
+
+Years without records are **not assumed to have zero abundance or richness**. Richness
+represents *recorded* species, not effort-standardized richness. These models do not adjust
+for changing sampling effort or imperfect detection.
+
+
+Row {data-height=460}
+-----------------------------------------------------------------------
+
+### Monitoring-site map
+
+```{r}
+uiOutput("site_map_ui")
+```
+
+The map displays sites with complete coordinates in the **current site and group selection**.
+Map tiles require an internet connection. Coordinates are optional and are never
+needed to fit the models.
