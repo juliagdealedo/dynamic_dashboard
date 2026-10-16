@@ -5,6 +5,9 @@ output:
     orientation: rows
     vertical_layout: scroll
 runtime: shiny
+resource_files:
+- data/power_simulations.csv
+- data/errors_simulations.csv
 ---
 
 <style>
@@ -811,20 +814,19 @@ The model tables also display simulation-derived **expected estimation error,
 Type M, Type S, power, and false-positive rate**. They use the nearest available
 cell in `data/errors_simulations.csv` and `data/power_simulations.csv` based on
 observed years, fitted latent log-scale AR(1) SD, and fitted AR(1) phi;
-power also uses the nearest simulated annual growth rate.
+power also uses the nearest simulated annual growth rate, based on preprint:  
+Julia G. de Aledo, Ignasi Bartomeus, François Duchenne. Available time-series of terrestrial 
+animals provide low reliability in population trend estimates, doi: https://doi.org/10.64898/2026.10.14.759066
+
 These are **model-based expectations**, not measured errors of the observed trends.
 They are unavailable if the AR(1) fit fails or for Gaussian abundance models.
-For richness, the abundance-based simulation surface is shown only as an
-**exploratory approximation**, not a validated richness reliability estimate.
 
 The **Download current selection (PDF)** button exports three model-report pages
 for the selected site, group, and species, plus a static site-location page if
 coordinates are available.
 
-Years without records are **not assumed to have zero abundance or richness**. Richness
-represents *recorded* species, not effort-standardized richness. These models do not adjust
-for changing sampling effort or imperfect detection.
-
+Years without records are **assumed to have zero abundance**. Richness
+represents *recorded* species, not effort-standardized richness.
 
 Row {data-height=450}
 -----------------------------------------------------------------------

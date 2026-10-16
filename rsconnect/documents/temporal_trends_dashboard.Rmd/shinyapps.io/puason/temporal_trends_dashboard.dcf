@@ -1,0 +1,12 @@
+name: temporal_trends_dashboard
+title: temporal_trends_dashboard
+username: puason
+account: puason
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 18200492
+bundleId: 12700252
+url: https://puason.shinyapps.io/temporal_trends_dashboard/
+version: 1
+asMultiple: FALSE
+asStatic: FALSE
