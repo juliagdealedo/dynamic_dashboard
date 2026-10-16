@@ -7,6 +7,57 @@ output:
 runtime: shiny
 ---
 
+<style>
+/* Keep every plot and its companion table at an equal relative width. */
+.chart-wrapper, .chart-container, .chart-stage { min-width: 0 !important; }
+.chart-wrapper table {
+  width: 100% !important;
+  table-layout: fixed !important;
+}
+.chart-wrapper table th, .chart-wrapper table td {
+  white-space: normal !important;
+  overflow-wrap: anywhere !important;
+  word-break: normal !important;
+}
+.chart-wrapper table th:first-child, .chart-wrapper table td:first-child { width: 43%; }
+.chart-wrapper table th:last-child, .chart-wrapper table td:last-child { width: 57%; }
+</style>
+
+<style>
+/* Prevent dashboard panels from expanding to fit tables */
+.chart-wrapper,
+.chart-stage,
+.chart-container {
+  min-width: 0 !important;
+}
+
+/* Restrict tables to their panel */
+.chart-wrapper table {
+  width: 100% !important;
+  max-width: 100% !important;
+  table-layout: fixed !important;
+}
+
+/* Allow long text to wrap */
+.chart-wrapper table th,
+.chart-wrapper table td {
+  white-space: normal !important;
+  overflow-wrap: anywhere !important;
+  word-break: break-word !important;
+}
+
+/* Allocate table-column widths */
+.chart-wrapper table th:first-child,
+.chart-wrapper table td:first-child {
+  width: 42%;
+}
+
+.chart-wrapper table th:last-child,
+.chart-wrapper table td:last-child {
+  width: 58%;
+}
+</style>
+
 ```{r global, include=FALSE}
 library(flexdashboard)
 library(shiny)
@@ -16,10 +67,142 @@ library(glmmTMB)
 library(grid)
 library(gridExtra)
 library(leaflet)
+library(data.table)
 
 # Keep the default CSV in the same folder as this Rmd file.
 default_file <- "synthetic_pollinator_counts_2014_2026_3sites.csv"
 required_columns <- c("year", "species", "group", "count")
+
+# Simulation reliability surfaces. Files are supplied by the user in data/.
+# The dashboard does not generate or modify either CSV.
+simulation_errors_path <- file.path("data", "errors_simulations.csv")
+simulation_power_path  <- file.path("data", "power_simulations.csv")
+
+load_surface <- function(path, required) {
+  if (!file.exists(path)) {
+    return(list(data = NULL, message = paste0("File not found: ", path)))
+  }
+  dat <- tryCatch(as.data.frame(data.table::fread(path)),
+                  error = function(e) e)
+  if (inherits(dat, "error"))
+    return(list(data = NULL, message = conditionMessage(dat)))
+  missing <- setdiff(required, names(dat))
+  if (length(missing)) {
+    return(list(data = NULL,
+                message = paste0(basename(path), " is missing columns: ",
+                                 paste(missing, collapse = ", "))))
+  }
+  for (col in required) {
+    dat[[col]] <- suppressWarnings(as.numeric(dat[[col]]))
+  }
+  key_cols <- intersect(c("duration", "phi", "sdev", "r"), required)
+  if (any(!is.finite(as.matrix(dat[, key_cols, drop = FALSE])))) {
+    return(list(data = NULL,
+                message = paste0(basename(path), " contains missing/non-numeric grid coordinates.")))
+  }
+  # Reliability metrics may legitimately be NA in some simulation cells.
+
+  list(data = dat, message = "")
+}
+
+error_surface <- load_surface(
+  simulation_errors_path,
+  c("duration", "phi", "sdev", "error", "type_M", "type_S", "false_pos")
+)
+power_surface <- load_surface(
+  simulation_power_path,
+  c("duration", "phi", "sdev", "r", "power")
+)
+
+# Select the closest EXISTING grid cell (duration, phi, sdev).
+# This is nearest-neighbour matching, not interpolation/extrapolation.
+# Matching to existing rows avoids impossible combinations in sparse grids.
+nearest_cell <- function(surface, duration, phi, sdev) {
+  coords <- c("duration", "phi", "sdev")
+  unique_cells <- unique(surface[, coords, drop = FALSE])
+  # Normalize by grid spacing so that year differences do not dominate phi.
+  steps <- vapply(coords, function(k) {
+    vals <- sort(unique(surface[[k]]))
+    d <- diff(vals)
+    if (length(d) == 0) return(1)
+    min(d[d > 0], na.rm = TRUE)
+  }, numeric(1))
+  dist2 <- ((unique_cells$duration - duration) / steps["duration"])^2 +
+           ((unique_cells$phi - phi) / steps["phi"])^2 +
+           ((unique_cells$sdev - sdev) / steps["sdev"])^2
+  unique_cells[which.min(dist2), , drop = FALSE]
+}
+
+lookup_reliability <- function(result, df, response) {
+  empty <- list(error = NA_real_, type_M = NA_real_, type_S = NA_real_,
+                power = NA_real_, false_pos = NA_real_,
+                matched = "", note = "")
+  if (is.null(error_surface$data) || is.null(power_surface$data)) {
+    empty$note <- paste(c(error_surface$message, power_surface$message)[
+      nzchar(c(error_surface$message, power_surface$message))], collapse = "; ")
+    return(empty)
+  }
+  if (!isTRUE(result$convergence) ||
+      !is.finite(result$latent_sd) ||
+      !is.finite(result$phi) ||
+      !is.finite(result$annual_change)) {
+    empty$note <- "No reliable AR(1) latent SD / phi estimate for surface matching."
+    return(empty)
+  }
+  if (!isTRUE(result$is_poisson)) {
+    empty$note <- "Gaussian log(1 + abundance) model is not directly comparable to the Poisson-lognormal simulation surface."
+    return(empty)
+  }
+  # For richness, this is an exploratory transfer of an abundance-based surface.
+  if (identical(response, "Richness")) {
+    empty$note <- "Richness: exploratory transfer of abundance simulation surface."
+  }
+
+  duration <- nrow(df)
+  phi <- result$phi
+  sdev <- result$latent_sd
+  r <- exp(result$slope) - 1
+
+  err_cell <- nearest_cell(error_surface$data, duration, phi, sdev)
+  err_rows <- error_surface$data[
+    error_surface$data$duration == err_cell$duration &
+    error_surface$data$phi == err_cell$phi &
+    error_surface$data$sdev == err_cell$sdev, , drop = FALSE]
+  # Avoid arbitrarily picking among duplicates with conflicting values.
+  metrics <- c("error", "type_M", "type_S", "false_pos")
+  if (nrow(unique(err_rows[, metrics, drop = FALSE])) != 1) {
+    empty$note <- paste("Error surface has conflicting results for the matched cell.")
+    return(empty)
+  }
+
+  power_cell <- nearest_cell(power_surface$data, duration, phi, sdev)
+  power_rows <- power_surface$data[
+    power_surface$data$duration == power_cell$duration &
+    power_surface$data$phi == power_cell$phi &
+    power_surface$data$sdev == power_cell$sdev, , drop = FALSE]
+  power_rows <- power_rows[which(abs(power_rows$r - r) ==
+                                 min(abs(power_rows$r - r))), , drop = FALSE]
+  if (nrow(unique(power_rows[, c("r", "power"), drop = FALSE])) != 1) {
+    empty$note <- "Power surface has conflicting equally close results."
+    return(empty)
+  }
+
+  empty$error <- err_rows$error[1]
+  empty$type_M <- err_rows$type_M[1]
+  empty$type_S <- err_rows$type_S[1]
+  empty$false_pos <- err_rows$false_pos[1]
+  empty$power <- power_rows$power[1]
+  empty$matched <- paste0(
+    "Error grid: n=", err_cell$duration, ", SD=", signif(err_cell$sdev, 3),
+    ", phi=", signif(err_cell$phi, 3),
+    "; power grid: n=", power_cell$duration,
+    ", SD=", signif(power_cell$sdev, 3),
+    ", phi=", signif(power_cell$phi, 3),
+    ", r=", signif(power_rows$r[1], 3)
+  )
+  empty
+}
+
 
 # Mandatory: year, species, group, count.
 # Optional: site, latitude, longitude (all independent optional fields).
@@ -104,6 +287,7 @@ fit_trend <- function(df, response = c("abundance", "richness"),
     model = "Not fitted", family = family_label,
     slope = NA_real_, annual_change = NA_real_,
     p_value = NA_real_, phi = NA_real_, aic = NA_real_,
+    latent_sd = NA_real_, is_poisson = is_poisson,
     residual_sd = NA_real_, convergence = NA,
     note = ""
   )
@@ -168,6 +352,12 @@ fit_trend <- function(df, response = c("abundance", "richness"),
     out$model <- paste0("GLMM with AR(1); ", family_label)
     out$convergence <- TRUE
     out$phi <- phi
+    # SD of the latent log-scale AR(1) random effect, NOT the
+    # Gaussian residual SD and NOT the SD of observed abundances.
+    out$latent_sd <- tryCatch(
+      as.numeric(attr(VarCorr(ar_fit)$cond$series_id, "stddev")[1]),
+      error = function(e) NA_real_
+    )
     out$aic <- as.numeric(AIC(ar_fit))
     out$residual_sd <- if (!is_poisson) as.numeric(sigma(ar_fit)) else NA_real_
   } else {
@@ -220,10 +410,15 @@ format_value <- function(x, digits = 3) {
 }
 
 model_table <- function(result, df, response) {
+  reliability <- lookup_reliability(result, df, response)
   data.frame(
     Metric = c("Response", "Observed years", "Period", "Mean observed value", "Variance of observed values",
                "Model", "Annual change (%; model scale)", "Slope (model scale)",
-               "Slope p-value", "AR(1) phi", "Residual SD (model scale)", "AIC", "AR(1) converged", "Note"),
+                "Slope p-value", "AR(1) phi", "Latent AR(1) SD (log scale)",
+               "Residual SD (model scale)", "AIC", "AR(1) converged",
+               "Expected estimation error", "Expected Type M",
+               "Expected Type S", "Expected power", "Expected false-positive rate",
+               "Simulation grid cell", "Reliability note", "Model note"),
     Value = c(response, nrow(df),
               paste(min(df$year), "–", max(df$year)),
               format_value(mean(if (response == "Richness") df$richness else df$abundance), 2),
@@ -232,10 +427,18 @@ model_table <- function(result, df, response) {
               format_value(result$slope, 4),
               format_value(result$p_value, 4),
               format_value(result$phi, 3),
+              format_value(result$latent_sd, 3),
               format_value(result$residual_sd, 3),
               format_value(result$aic, 1),
               if (is.na(result$convergence)) "Not fitted" else
                 if (result$convergence) "Yes" else "No (fallback)",
+              format_value(reliability$error, 4),
+              format_value(reliability$type_M, 3),
+              format_value(reliability$type_S, 3),
+              format_value(reliability$power, 3),
+              format_value(reliability$false_pos, 3),
+              reliability$matched,
+              reliability$note,
               result$note),
     stringsAsFactors = FALSE
   )
@@ -252,8 +455,8 @@ plot_series <- function(df, result, response, heading, ylab) {
   }
   ggplot(df, aes(x = year, y = .data[[response]])) +
     geom_line(color = "#63748a", linewidth = 0.2) +
-    geom_point(color = "#245c85", size = 9, alpha=0.4) +
-    geom_line(aes(y = predicted), color = "#d47734", linewidth = 2.4,
+    geom_point(color = "#245c85", size = 5, alpha=0.4) +
+    geom_line(aes(y = predicted), color = "#d47734", linewidth = 2,
               na.rm = TRUE) +
     scale_x_continuous(breaks = pretty(df$year, n = 8)) +
     labs(title = heading, subtitle = subtitle, x = "Year", y = ylab,
@@ -265,7 +468,7 @@ plot_series <- function(df, result, response, heading, ylab) {
 }
 ```
 
-Column {.sidebar data-width=300}
+Column {.sidebar data-width=350}
 -----------------------------------------------------------------------
 
 ### Data and filters
@@ -274,8 +477,7 @@ Column {.sidebar data-width=300}
 fileInput("uploaded_csv", "Upload your own CSV (optional)",
           accept = c(".csv", "text/csv"))
 helpText("Default: synthetic_pollinator_counts_2014_2026_3sites.csv")
-helpText("Required: year, species, group, count.")
-helpText("Optional: site, latitude, longitude.")
+helpText("Required: year, species, group, count. Optional: site, latitude, longitude.")
 
 counts_data <- reactive({
   path <- if (is.null(input$uploaded_csv)) default_file else input$uploaded_csv$datapath
@@ -499,7 +701,7 @@ output$site_map <- renderLeaflet({
         "<br>Latitude: ", round(latitude, 5),
         "<br>Longitude: ", round(longitude, 5)
       ),
-      radius = 7, color = "#d47734", fillOpacity = 0.8
+      radius = 12, color = "#185e88", fillOpacity = 0.9
     )
   if (nrow(loc) == 1) {
     m <- m %>% setView(lng = loc$longitude[1],
@@ -516,22 +718,24 @@ output$site_map <- renderLeaflet({
 })
 ```
 
-Row {data-height=460}
+Row {data-height=380}
 -----------------------------------------------------------------------
 
-### Community abundance trend
+### Community abundance trend {data-width=500}
 
 ```{r}
 renderPlot({
-  heading <- if (input$selected_group == "All") "All groups — TOTAL ABUNDANCE" else
-    paste(input$selected_group, "— TOTAL ABUNDANCE")
+  heading <- if (input$selected_group == "All") "All groups — total abundance" else
+    paste(input$selected_group, "— total abundance")
   plot_series(community_years(), community_abundance_model(),
               "abundance", heading, "Summed abundance")
 })
 ```
 
+Row {data-height=680}
+-----------------------------------------------------------------------
 
-### Community abundance model details
+### Community abundance model details {data-width=500}
 
 ```{r}
 renderTable({
@@ -541,33 +745,25 @@ renderTable({
 
 
 
-Row {data-height=460}
+Row {data-height=680}
 -----------------------------------------------------------------------
 
 
-### Community species-richness trend
+### Community species-richness trend {data-width=500}
 
 ```{r}
 renderPlot({
-  heading <- if (input$selected_group == "All") "All groups — SPECIES RICHNESS" else
-    paste(input$selected_group, "— SPECIES RICHNESS")
+  heading <- if (input$selected_group == "All") "All groups — species richness" else
+    paste(input$selected_group, "— species richness")
   plot_series(community_years(), community_richness_model(),
               "richness", heading, "Number of species with positive count")
 })
 ```
 
-### Community richness model details
-
-```{r}
-renderTable({
-  model_table(community_richness_model(), community_years(), "Richness")
-}, striped = TRUE, spacing = "xs")
-```
-
-Row {data-height=460}
+Row {data-height=680}
 -----------------------------------------------------------------------
 
-### Selected species — abundance trend
+### Selected species — abundance trend {data-width=500}
 
 ```{r}
 renderPlot({
@@ -577,7 +773,10 @@ renderPlot({
 })
 ```
 
-### Selected species — model details
+
+Row {data-height=680}
+-----------------------------------------------------------------------
+### Selected species — model details {data-width=500}
 
 ```{r}
 renderTable({
@@ -585,7 +784,7 @@ renderTable({
 }, striped = TRUE, spacing = "xs")
 ```
 
-Row {data-height=210}
+Row {data-height=500}
 -----------------------------------------------------------------------
 
 ### Interpretation and data assumptions
@@ -608,6 +807,16 @@ The displayed annual percentage change is `100 * (exp(slope) - 1)`.
 For Gaussian models this describes **1 + abundance**, not abundance itself.
 Each model attempts an AR(1) correlation structure; if it fails diagnostics,
 the dashboard explicitly reports a fallback model without AR(1).
+The model tables also display simulation-derived **expected estimation error,
+Type M, Type S, power, and false-positive rate**. They use the nearest available
+cell in `data/errors_simulations.csv` and `data/power_simulations.csv` based on
+observed years, fitted latent log-scale AR(1) SD, and fitted AR(1) phi;
+power also uses the nearest simulated annual growth rate.
+These are **model-based expectations**, not measured errors of the observed trends.
+They are unavailable if the AR(1) fit fails or for Gaussian abundance models.
+For richness, the abundance-based simulation surface is shown only as an
+**exploratory approximation**, not a validated richness reliability estimate.
+
 The **Download current selection (PDF)** button exports three model-report pages
 for the selected site, group, and species, plus a static site-location page if
 coordinates are available.
@@ -617,7 +826,7 @@ represents *recorded* species, not effort-standardized richness. These models do
 for changing sampling effort or imperfect detection.
 
 
-Row {data-height=460}
+Row {data-height=450}
 -----------------------------------------------------------------------
 
 ### Monitoring-site map
